@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+kp - kill TCP listeners on a port
+
+Usage:
+  kp [options] <port> [port ...]
+
+Options:
+  -l, --list    Show processes that would be killed, do nothing
+  -f, --force   Skip SIGTERM, go straight to SIGKILL
+  -h, --help    Show this help
+
+Examples:
+  kp 8080
+  kp 3000 8080 9090
+  kp -l 8080
+  kp -f 8080
+EOF
+}
+
+die() { echo "kp: $*" >&2; exit 1; }
+command -v lsof >/dev/null || die "lsof is required"
+
+LIST=0
+FORCE=0
+PORTS=()
+while (( $# )); do
+  case "$1" in
+    -h|--help)  usage; exit 0 ;;
+    -l|--list)  LIST=1;  shift ;;
+    -f|--force) FORCE=1; shift ;;
+    --)         shift; PORTS+=("$@"); break ;;
+    -*)         die "unknown option: $1 (try: kp --help)" ;;
+    *)          PORTS+=("$1"); shift ;;
+  esac
+done
+
+(( ${#PORTS[@]} > 0 )) || { usage >&2; exit 1; }
+
+for i in "${!PORTS[@]}"; do
+  PORTS[$i]="${PORTS[$i]#:}"
+  [[ "${PORTS[$i]}" =~ ^[0-9]+$ ]] || die "invalid port: ${PORTS[$i]}"
+done
+
+pids_on() { lsof -nP -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | sort -u; }
+show_on() { lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null; }
+
+exit_code=0
+for port in "${PORTS[@]}"; do
+  mapfile -t pids < <(pids_on "$port")
+  if (( ${#pids[@]} == 0 )); then
+    echo ":$port  no TCP listener"
+    continue
+  fi
+
+  if (( LIST )); then
+    echo ":$port  would kill:"
+    show_on "$port" | sed 's/^/  /'
+    continue
+  fi
+
+  if (( FORCE )); then
+    echo ":$port  SIGKILL -> ${pids[*]}"
+    for p in "${pids[@]}"; do kill -9 "$p" 2>/dev/null || true; done
+    continue
+  fi
+
+  echo ":$port  SIGTERM -> ${pids[*]}"
+  for p in "${pids[@]}"; do kill "$p" 2>/dev/null || true; done
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 0.2
+    mapfile -t alive < <(pids_on "$port")
+    (( ${#alive[@]} == 0 )) && break
+  done
+  mapfile -t alive < <(pids_on "$port")
+  if (( ${#alive[@]} > 0 )); then
+    echo ":$port  still alive, SIGKILL -> ${alive[*]}"
+    for p in "${alive[@]}"; do kill -9 "$p" 2>/dev/null || true; done
+    mapfile -t alive < <(pids_on "$port")
+    if (( ${#alive[@]} > 0 )); then
+      echo ":$port  FAILED, still running: ${alive[*]}" >&2
+      exit_code=1
+    fi
+  fi
+done
+exit "$exit_code"
